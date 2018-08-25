@@ -24,6 +24,7 @@ import json
 import shlex
 import shutil
 import textwrap
+import platform
 from enum import Enum
 from pathlib import PurePath
 
@@ -844,17 +845,19 @@ class PkgConfigDependency(ExternalDependency):
 
 class DubDependency(ExternalDependency):
     class_dubbin = None
+    class_compbin = None
 
     def __init__(self, name, environment, kwargs):
         super().__init__('dub', environment, 'd', kwargs)
         self.name = name
         self.compiler = super().get_compiler()
+        self.module_path = None
 
         if 'required' in kwargs:
             self.required = kwargs.get('required')
 
         if DubDependency.class_dubbin is None:
-            self.dubbin = self.check_dub()
+            self.dubbin = self._check_dub()
             DubDependency.class_dubbin = self.dubbin
         else:
             self.dubbin = DubDependency.class_dubbin
@@ -864,6 +867,13 @@ class DubDependency(ExternalDependency):
                 raise DependencyException('DUB not found.')
             self.is_found = False
             return
+
+        comp = self.compiler.get_id().replace('llvm', 'ldc').replace('gcc', 'gdc')
+        if DubDependency.class_compbin is None:
+            self.compbin = self._check_comp(comp)
+            DubDependency.class_compbin = self.compbin
+        else:
+            self.compbin = DubDependency.class_compbin
 
         mlog.debug('Determining dependency {!r} with DUB executable '
                    '{!r}'.format(name, self.dubbin.get_path()))
@@ -875,20 +885,20 @@ class DubDependency(ExternalDependency):
             self.is_found = False
             return
 
+        packages = []
         j = json.loads(res)
-        comp = self.compiler.get_id().replace('llvm', 'ldc').replace('gcc', 'gdc')
         for package in j['packages']:
+            packages.append(package['name'])
             if package['name'] == name:
-                if j['compiler'] != comp:
-                    msg = ['Dependency', mlog.bold(name), 'found but it was compiled with']
-                    msg += [mlog.bold(j['compiler']), 'and we are using', mlog.bold(comp)]
-                    mlog.error(*msg)
+                self.module_path = self._find_right_lib_path(package['path'], comp, j, True, package['targetFileName'])
+
+                if not os.path.exists(self.module_path):
+                    mlog.error(mlog.bold(name), 'found but it wasn\'t compiled with', mlog.bold(comp))
                     self.is_found = False
                     return
 
                 self.version = package['version']
                 self.pkg = package
-                break
 
         if self.pkg['targetFileName'].endswith('.a'):
             self.static = True
@@ -903,35 +913,88 @@ class DubDependency(ExternalDependency):
         for flag in self.pkg['lflags']:
             self.link_args.append(flag)
 
-        search_paths = []
-        search_paths.append(os.path.join(self.pkg['path'], self.pkg['targetPath']))
-        found, res = self.__search_paths(search_paths, self.pkg['targetFileName'])
-        for file in res:
-            self.link_args.append(file)
+        self.link_args.append(os.path.join(self.module_path, self.pkg['targetFileName']))
+        self.raw_link_args = self.link_args
 
-        self.is_found = found
+        # Handle dependencies
+        libs = []
+
+        def add_lib_args(field_name, target):
+            if field_name in target['buildSettings']:
+                if os.name is 'nt':
+                    for lib in target['buildSettings'][field_name]:
+                        if lib not in target['buildSettings'][field_name]:
+                            libs.append(lib)
+                            # TODO: Use CCompiler.find_library to find the path of the .lib files
+                else: # posix and everything else
+                    for lib in target['buildSettings'][field_name]:
+                        if lib not in libs:
+                            libs.append(lib)
+                            pkgdep = PkgConfigDependency(lib, environment, {'required': 'true', 'silent': 'true'})
+                            for arg in pkgdep.get_compile_args():
+                                self.compile_args.append(arg)
+                            for arg in pkgdep.get_link_args():
+                                self.link_args.append(arg)
+                            for arg in pkgdep.get_link_args(raw=True):
+                                self.raw_link_args.append(arg)
+
+        for target in j['targets']:
+            if target['rootPackage'] in packages:
+                add_lib_args('libs', target)
+                add_lib_args('libs-{}'.format(platform.machine()), target)
+                for file in target['buildSettings']['linkerFiles']:
+                    self.link_args.append(self._find_right_lib_path(file, comp, j))
 
     def get_compiler(self):
         return self.compiler
 
-    def __search_paths(self, search_paths, target_file):
-        found = False
-        res = []
-        if target_file == '':
-            return True, res
-        for path in search_paths:
-                if os.path.isdir(path):
-                    for file in os.listdir(path):
-                        if file == target_file:
-                            res.append(os.path.join(path, file))
-                            found = True
-        return found, res
+    def _find_right_lib_path(self, default_path, comp, j, folder_only=False, file_name=''):
+        path = ''
+
+        module_build_path = lib_file_name = ''
+        if folder_only:
+            module_build_path = default_path
+            lib_file_name = file_name
+        else:
+            module_build_path = os.path.dirname(default_path)
+            lib_file_name = os.path.basename(default_path)
+
+        # Get D version implemented in the compiler
+        # gdc doesn't support this
+        ret, res = self._call_dubbin(['--version'])
+
+        if ret != 0:
+            mlog.error('Failed to run {!r}', mlog.bold(comp))
+            self.is_found = False
+            return
+
+        d_ver = re.search('v[0-9].[0-9][0-9][0-9].[0-9]', res) # Ex.: v2.081.2
+        if d_ver is not None:
+            d_ver = d_ver.group().rsplit('.', 1)[0].replace('v', '').replace('.', '') # Fix structure. Ex.: 2081
+        else:
+            d_ver = '' # gdc
+
+        # Ex.: library-debug-linux.posix-x86_64-ldc_2081-EF934983A3319F8F8FF2F0E107A363BA
+        build_name = '{}-{}-{}.{}-{}-{}_{}'.format(j['configuration'], j['buildType'], j['platform'][0], j['platform'][1], platform.machine(), comp, d_ver)
+        for entry in os.listdir(os.path.join(module_build_path, '.dub', 'build')):
+            if entry.startswith(build_name):
+                if folder_only:
+                    path = os.path.join(module_build_path, '.dub', 'build', entry)
+                else:
+                    path = os.path.join(module_build_path, '.dub', 'build', entry, lib_file_name)
+                break
+
+        return path
 
     def _call_dubbin(self, args, env=None):
         p, out = Popen_safe(self.dubbin.get_command() + args, env=env)[0:2]
         return p.returncode, out.strip()
 
-    def check_dub(self):
+    def _call_copmbin(self, args, env=None):
+        p, out = Popen_safe(self.compbin.get_command() + args, env=env)[0:2]
+        return p.returncode, out.strip()
+
+    def _check_dub(self):
         dubbin = ExternalProgram('dub', silent=True)
         if dubbin.found():
             try:
@@ -952,6 +1015,25 @@ class DubDependency(ExternalDependency):
         else:
             mlog.log('Found DUB:', mlog.red('NO'))
         return dubbin
+
+    def _check_comp(self, comp):
+        compbin = ExternalProgram(comp, silent=True)
+        if compbin.found():
+            try:
+                p, out = Popen_safe(compbin.get_command() + ['--version'])[0:2]
+                if p.returncode != 0:
+                    mlog.warning('Found dub {!r} but couldn\'t run it'
+                                 ''.format(' '.join(compbin.get_command())))
+                    # Set to False instead of None to signify that we've already
+                    # searched for it and not found it
+                    compbin = False
+            except (FileNotFoundError, PermissionError):
+                compbin = False
+        else:
+            compbin = False
+        if compbin:
+            mlog.debug('Didn\'t find compiler executable!')
+        return compbin
 
     @staticmethod
     def get_methods():

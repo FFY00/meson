@@ -294,6 +294,10 @@ class DCompiler(Compiler):
                 # a linker search path.
                 dcargs.append('-L' + arg)
                 continue
+            elif arg.startswith('/') or arg.startswith('./'):
+                # absolute (or relative) paths passed to the linker may be static libraries
+                # or other objects that we need to link.
+                dcargs.append('-L' + arg)
             elif arg.startswith('-mscrtlib='):
                 mscrtlib = arg[10:].lower()
 
@@ -309,6 +313,7 @@ class DCompiler(Compiler):
                         dcargs.append('-L/DEFAULTLIB:legacy_stdio_definitions.lib')
 
                 dcargs.append(arg)
+
                 continue
             dcargs.append(arg)
 
